@@ -1,0 +1,636 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+# Import packages 
+from time import time
+import numpy as np
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"
+import keras
+from keras import backend as K
+from keras.engine.topology import Layer, InputSpec
+from keras.layers import Input, Dense, Flatten, Reshape, Conv3D, Conv3DTranspose, LeakyReLU
+from keras.layers.core import Lambda
+from keras.models import Sequential, Model
+from keras.utils.vis_utils import plot_model
+from sklearn.cluster import KMeans
+import metrics
+import math
+import tensorflow as tf
+import cv2
+from tensorflow.python.framework import ops
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import math
+from glob import glob
+import rpy2.robjects as robjects
+from rpy2.robjects import r, numpy2ri
+robjects.numpy2ri.activate()
+from scipy.ndimage import zoom
+
+
+# In[2]:
+
+
+wd = "/Users/sarahryan/Documents/GitHub/CLAM_data/"  
+n_clusters = 2
+save_dir = wd
+visualisation_dir = save_dir
+files = glob(wd + "*.Rdata")
+n = len(files)
+
+
+# In[3]:
+
+
+x = np.zeros((n,88,88,88,1))
+i = 0
+for file in files:
+    print(file)
+    robjects.r['load'](file)
+    x[i,:,:,:,0] = robjects.r['img']
+    i += 1
+    
+# Normalize images
+nm = np.max(x)
+x = (x)/nm
+
+# Set the background to the mean of all the images.
+x0 = x[x!=0]
+idx = x == 0
+x[idx] = x0.mean()
+input_shape=x.shape[1:]
+
+
+# In[4]:
+
+
+def CAE(input_shape=(88, 88, 88, 1), filters=[16,32, 64, 60]):
+    model = Sequential()
+    if input_shape[0] % 8 == 0:
+        pad3 = 'same'
+    else:
+        pad3 = 'valid'
+    myaf = LeakyReLU(alpha=0.1) # 'relu'
+    model.add(Conv3D(filters[0], 4, strides=2, padding='same', name='conv1', input_shape=input_shape))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Conv3D(filters[1], 4, strides=2, padding='same', name='conv2'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Conv3D(filters[2], 4, strides=2, padding='same', name='conv3'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Flatten())
+    model.add(Dense(units=filters[3], name='embedding'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Dense(units=filters[2]*int(model.layers[4].output.shape[1])*int(model.layers[4].output.shape[2])*int(model.layers[4].output.shape[3]), activation='relu'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Reshape((int(model.layers[4].output.shape[1]), int(model.layers[4].output.shape[2]), int(model.layers[4].output.shape[3]), filters[2])))
+    model.add(Conv3DTranspose(filters[1], 4, strides=2, padding='same', name='deconv3'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Conv3DTranspose(filters[0], 4, strides=2, padding='same', name='deconv2'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Conv3DTranspose(input_shape[3], 4, strides=2, padding='same', name='deconv1'))
+    model.add(LeakyReLU(alpha=0.1, name='reconstruction'))
+    # model.summary()
+    return model
+
+
+# In[5]:
+
+
+class ClusteringLayer(Layer):
+    """
+    Clustering layer converts input sample (feature) to soft label, i.e. a vector that represents the probability of the
+    sample belonging to each cluster. The probability is calculated with student's t-distribution.
+    # Example
+    ```
+        model.add(ClusteringLayer(n_clusters=10))
+    ```
+    # Arguments
+        n_clusters: number of clusters.
+        weights: list of Numpy array with shape `(n_clusters, n_features)` witch represents the initial cluster centers.
+        alpha: parameter in Student's t-distribution. Default to 1.0.
+    # Input shape
+        2D tensor with shape: `(n_samples, n_features)`.
+    # Output shape
+        2D tensor with shape: `(n_samples, n_clusters)`.
+    """
+
+    def __init__(self, n_clusters, weights=None, alpha=1.0, **kwargs):
+        if 'input_shape' not in kwargs and 'input_dim' in kwargs:
+            kwargs['input_shape'] = (kwargs.pop('input_dim'),)
+        super(ClusteringLayer, self).__init__(**kwargs)
+        self.n_clusters = n_clusters
+        self.alpha = alpha
+        self.initial_weights = weights
+        self.input_spec = InputSpec(ndim=2)
+
+    def build(self, input_shape):
+        assert len(input_shape) == 2
+        input_dim = input_shape[1]
+        self.input_spec = InputSpec(dtype=K.floatx(), shape=(None, input_dim))
+        self.clusters = self.add_weight(shape = (self.n_clusters, input_dim), initializer='glorot_uniform', name='clusters')
+        if self.initial_weights is not None:
+            self.set_weights(self.initial_weights)
+            del self.initial_weights
+        self.built = True
+
+    def call(self, inputs, **kwargs):
+        """ student t-distribution, as same as used in t-SNE algorithm.
+                 q_ij = 1/(1+dist(x_i, u_j)^2), then normalize it.
+        Arguments:
+            inputs: the variable containing data, shape=(n_samples, n_features)
+        Return:
+            q: student's t-distribution, or soft labels for each sample. shape=(n_samples, n_clusters)
+        """
+        q = 1.0 / (1.0 + (K.sum(K.square(K.expand_dims(inputs, axis=1) - self.clusters), axis=2) / self.alpha))
+        q **= (self.alpha + 1.0) / 2.0
+        q = K.transpose(K.transpose(q) / K.sum(q, axis=1))
+        return q
+
+    def compute_output_shape(self, input_shape):
+        assert input_shape and len(input_shape) == 2
+        return input_shape[0], self.n_clusters
+
+    def get_config(self):
+        config = {'n_clusters': self.n_clusters}
+        base_config = super(ClusteringLayer, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+# In[6]:
+
+
+class DCEC(object):
+    def __init__(self,
+                 input_shape,
+                 filters=[32, 64, 128, 10],
+                 n_clusters=10,
+                 alpha=1.0):
+
+        super(DCEC, self).__init__()
+
+        self.n_clusters = n_clusters
+        self.input_shape = input_shape
+        self.alpha = alpha
+        self.pretrained = False
+        self.y_pred = []
+
+        self.cae = CAE(input_shape, filters)
+        hidden = self.cae.get_layer(name='embedding').output
+        self.encoder = Model(inputs=self.cae.input, outputs=hidden)
+
+        # Define DCEC model
+        clustering_layer = ClusteringLayer(self.n_clusters, name='clustering')(hidden)
+        self.model = Model(inputs=self.cae.input,
+                           outputs=[clustering_layer, self.cae.output])
+
+    def pretrain(self, x, epochs=200, optimizer='adam', save_dir='results/temp'):
+        print('...Pretraining...')
+        self.cae.compile(optimizer=optimizer, loss='mse')
+        from keras.callbacks import CSVLogger
+        csv_logger = CSVLogger(save_dir + '/pretrain_log.csv')
+
+        # begin training
+        t0 = time()
+        for ite in range(int(epochs)):
+            self.cae.fit(x, x, epochs=1, callbacks=[csv_logger])
+            print(ite)
+            self.cae.save(save_dir + '/pretrain_cae_model_temp.h5')
+
+        print('Pretraining time: ', time() - t0)
+        self.cae.save(save_dir + '/pretrain_cae_model.h5')
+        print('Pretrained weights are saved to %s/pretrain_cae_model.h5' % save_dir)
+        self.pretrained = True
+
+    def load_weights(self, weights_path):
+        self.model.load_weights(weights_path)
+
+    def extract_feature(self, x):  # extract features from before clustering layer
+        return self.encoder.predict(x)
+
+    def predict(self, x):
+        q, _ = self.model.predict(x, verbose=0)
+        return q.argmax(1)
+
+    def predictSoft(self, x):
+        q, _ = self.model.predict(x, verbose=0)
+        return q
+
+    @staticmethod
+    def target_distribution(q):
+        weight = q ** 2 / q.sum(0)
+        return (weight.T / weight.sum(1)).T
+
+    def compile(self, loss=['kld', 'mse'], loss_weights=[1, 1], optimizer='adam'):
+        self.model.compile(loss=loss, loss_weights=loss_weights, optimizer=optimizer)
+    # def compile(self, loss=['kld', 'mse'], loss_weights=[1, 1], optimizer='adam'):
+    #    if (loss == 'mse'):
+     #       self.model.compile(loss=loss, loss_weights=loss_weights, optimizer=optimizer)
+      #  else:
+       #     unconf_indices, conf_indices = generate_unconflicted_data_index(self.model.y_pred, beta1=0.5, beta2=0.25)
+        #    self.model.compile(loss=[custom_loss(unconf_indices, conf_indices), custom_loss2(unconf_indices, conf_indices)], loss_weights=[0.1, 1], optimizer=optimizer)
+            # self.model.compile(loss=['kld', 'mse'], loss_weights=[0.1, 1], optimizer=optimizer)
+
+    def fit(self, x, y=None, epochs=200, maxiter=2e4, tol=1e-3,
+            update_interval=10, cae_weights=None, save_dir='./results/temp'):
+
+        print('Update interval', update_interval)
+        save_interval = 1
+        print('Save interval', save_interval)
+
+        # Step 1: pretrain if necessary
+        t0 = time()
+        if not self.pretrained and cae_weights is None:
+            print('...pretraining CAE using default hyper-parameters:')
+            print('   optimizer=\'adam\';   epochs=' + str(epochs))
+            self.pretrain(x, epochs = epochs, save_dir=save_dir)
+            self.pretrained = True
+        elif cae_weights is not None:
+            self.cae.load_weights(cae_weights)
+            print('cae_weights is loaded successfully.')
+
+        # Step 2: initialize cluster centers using k-means
+        t1 = time()
+        print('Initializing cluster centers with k-means.')
+        kmeans = KMeans(n_clusters=self.n_clusters, n_init=100)
+        featuresPre = self.encoder.predict(x)
+        np.savetxt(save_dir + '/featuresPre.csv', featuresPre, delimiter=",")
+        self.y_pred = kmeans.fit_predict(featuresPre)
+        y_pred_last = np.copy(self.y_pred)
+        self.model.get_layer(name='clustering').set_weights([kmeans.cluster_centers_])
+
+        # Step 3: deep clustering
+        # logging file
+        import csv, os
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        logfile = open(save_dir + '/dcec_log' + str(self.n_clusters) + '.csv', 'w')
+        logwriter = csv.DictWriter(logfile, fieldnames=['iter', 'acc', 'nmi', 'L', 'Lc', 'Lr'])
+        logwriter.writeheader()
+
+        t2 = time()
+        loss = [0, 0, 0]
+        index = 0
+        ite = 0
+        acc = 0
+        for ite in range(int(maxiter)):
+            if ite % update_interval == 0:
+                q = self.predictSoft(x)
+                p = self.target_distribution(q)  # update the auxiliary target distribution p
+
+                # evaluate the clustering performance
+                self.y_pred = q.argmax(1)
+                if y is not None:
+                    acc = np.round(metrics.acc(y, self.y_pred), 5)
+                    nmi = np.round(metrics.nmi(y, self.y_pred), 5)
+                    # loss = np.round(loss, 5)
+                logdict = dict(iter=ite, acc=acc, nmi=nmi, L=loss[0], Lc=loss[1], Lr=loss[2])
+                logwriter.writerow(logdict)
+                print('Iter', ite, ': Acc', acc, ', nmi', nmi, '; loss=', loss)
+
+            # save intermediate model
+            if ite % 10 == 0:
+                print('saving model to:', save_dir + '/dcec_model_k' + str(n_clusters) + "_"+ str(ite) + '.h5')
+                self.model.save_weights(save_dir + '/dcec_model_k' + str(n_clusters) + "_"+ str(ite) + '.h5')
+
+            self.model.save_weights(save_dir + '/dcec_model_k' + str(n_clusters) + "_temp.h5")
+            print(str(ite))
+
+
+            # train on batch
+            myfit = self.model.fit(x=x,y=[p, x],verbose=0,epochs=1)
+            L = myfit.history['loss'][0]
+            Lc = myfit.history['clustering_loss'][0]
+            Lr = myfit.history['reconstruction_loss'][0]
+            loss = [L,Lc,Lr]
+
+            ite += 1
+
+        # save the trained model
+        logfile.close()
+        print('saving model to:', save_dir + '/dcec_model_final' + str(self.n_clusters) + '.h5')
+        self.model.save_weights(save_dir + '/dcec_model_final' + str(self.n_clusters) + '.h5')
+        t3 = time()
+        print('Pretrain time:  ', t1 - t0)
+        print('Clustering time:', t3 - t1)
+        print('Total time:     ', t3 - t0)
+
+
+# In[7]:
+
+
+def sigmoid(x, a, b, c):
+    return c / (1 + np.exp(-a * (x-b)))
+def superimpose(img_bgr, cam, emphasize=False):
+    
+    # img_bgr = cv2.imread(original_img_path)
+
+    heatmap = np.copy(cam)
+    # heatmap = cv2.resize(cam, (img_bgr.shape[1], img_bgr.shape[0]), interpolation = cv2.INTER_LINEAR)
+    #img_bgr = cv2.resize(cam, (img_bgr.shape[1], img_bgr.shape[0]))
+    if emphasize:
+        heatmap = sigmoid(heatmap, 50, 0.5, 1)
+        heatmap = np.uint8(255 * heatmap)
+    heatmap = np.uint8(255 * heatmap)
+    img_bgr = np.uint8(255 * img_bgr) # Maybe add something here so that I don't get white areas on the superimage
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    
+    hif = .8
+    superimposed_img = heatmap * hif + img_bgr
+    superimposed_img = np.minimum(superimposed_img, 255.0).astype(np.uint8)  # scale 0 to 255  
+    superimposed_img_rgb = cv2.cvtColor(superimposed_img, cv2.COLOR_BGR2RGB)
+    
+    return superimposed_img_rgb
+
+# Now try to get the score CAM working
+def ScoreCam(model, img_array, layer_name, max_N=-1):
+
+    cls = np.argmax(model.predict(img_array))
+    act_map_array = Model(inputs=model.input, outputs=model.get_layer(layer_name).output).predict(img_array)
+    
+    # extract effective maps
+    if max_N != -1:
+        act_map_std_list = [np.std(act_map_array[0,:,:,:,k]) for k in range(act_map_array.shape[4])]
+        unsorted_max_indices = np.argpartition(-np.array(act_map_std_list), max_N)[:max_N]
+        max_N_indices = unsorted_max_indices[np.argsort(-np.array(act_map_std_list)[unsorted_max_indices])]
+        act_map_array = act_map_array[:,:,:,:,max_N_indices]
+
+    # input_shape = model.layers[0].output_shape[1:]  # get input shape
+    # input_shape = (input_shape[2], input_shape[1], input_shape[0], 1)
+    input_shpae = (88,88,88,1)
+    
+    # 1. upsampled to original input size
+    size = img_array.shape[1]/act_map_array.shape[1]
+    act_map_resized_list = [zoom(act_map_array[0,:,:,:,k], (size,size,size)) for k in range(act_map_array.shape[3])]
+    
+    # 2. normalize the raw activation value in each activation map into [0, 1]
+    act_map_normalized_list = []
+    for act_map_resized in act_map_resized_list:
+        if np.max(act_map_resized) - np.min(act_map_resized) != 0:
+            act_map_normalized = (act_map_resized - np.min(act_map_resized))/ (np.max(act_map_resized) - np.min(act_map_resized))
+        else:
+            act_map_normalized = act_map_resized
+        act_map_normalized_list.append(act_map_normalized)
+    
+    # 3. project highlighted area in the activation map to original input space by multiplying the normalized activation map
+    masked_input_list = []
+    for act_map_normalized in act_map_normalized_list:
+        masked_input = np.copy(img_array)
+        for k in range(img_array.shape[4]):
+            masked_input[0,:,:,:,k] *= act_map_normalized
+        masked_input_list.append(masked_input)
+    masked_input_array = np.concatenate(masked_input_list, axis=0)
+    
+    # 4. feed masked inputs into CNN model and softmax
+    pred_from_masked_input_array = model.predict(masked_input_array)
+    
+    # 5. define weight as the score of target class
+    weights = pred_from_masked_input_array[:,cls]
+    
+    # 6. get final class discriminative localization map as linear weighted combination of all activation maps
+#     cam = np.dot(act_map_array[0,:,:,:,:], weights)
+#     cam = np.maximum(0, cam)  # Passing through ReLU
+#     cam /= np.max(cam)  # scale 0 to 1.0
+    
+    hi = np.stack(act_map_resized_list, axis = 3)
+    cam2 = np.dot(hi[:,:,:,:], weights)
+    cam2 = np.maximum(0, cam2)  # Passing through ReLU
+    # cam2 /= np.max(cam2)  # scale 0 to 1.0
+
+    return cam2
+
+def softmax(x):
+    f = np.exp(x)/np.sum(np.exp(x), axis = 1, keepdims = True)
+    return f
+
+
+# In[8]:
+
+
+#x.shape[1:]
+input_shape=x.shape[1:] # input_shape=(48, 64, 1)
+filters=[16,32, 64, 60]
+
+
+# In[9]:
+
+
+# Prepare the DCEC model
+# n_clusters = 2
+dcec = DCEC(input_shape=input_shape, filters=filters, n_clusters=n_clusters)
+plot_model(dcec.model, to_file=save_dir + '/dcec_model' + str(n_clusters) + '.png', show_shapes=True)
+dcec.model.summary()
+
+
+# In[10]:
+
+
+dcec.load_weights(save_dir + '/dcec_model_final' + str(n_clusters) + '.h5')
+
+
+# In[11]:
+
+
+# Create new model with only the encoder and clustering layer (for ScoreCAM to work)
+hidden = dcec.model.get_layer(name='embedding').output
+new_model = Model(inputs=dcec.model.input, outputs=dcec.model.output[0])
+new_model.summary()
+# print(new_model.layers[0].output_shape[1:])
+print(new_model.layers[0].output_shape)
+
+# In[12]:
+
+
+# i = 200
+# img = np.expand_dims(x[i], axis=0)
+# myscorecam = ScoreCam(model = new_model, 
+#                       img_array = img, 
+#                       layer_name = 'leaky_re_lu_3',
+#                       max_N=-1)
+# 
+# 
+# # In[13]:
+# 
+# 
+# plt.imshow(myscorecam[40,:,:])
+# 
+# 
+# # In[14]:
+# 
+# 
+# myscorecam2 = ScoreCam(model = new_model, 
+#                       img_array = img, 
+#                       layer_name = 'leaky_re_lu_2',
+#                       max_N=-1)
+# 
+# 
+# # In[15]:
+# 
+# 
+# plt.imshow(myscorecam2[40,:,:])
+# 
+# 
+# # In[16]:
+# 
+# 
+# Find Score-CAM for each image and save output
+myscorecamsNorm4 = np.zeros((n,88,88,88))
+for i in range(n):
+    img = np.expand_dims(x[i], axis=0)
+    myscorecam1 = ScoreCam(model = new_model,
+                          img_array = img,
+                          layer_name = 'leaky_re_lu_3',
+                          max_N=-1)
+    myscorecamsNorm4[i,:,:,:] = myscorecam1
+myscorecamsNorm4 /= np.max(myscorecamsNorm4)
+# ro = numpy2ri(myscorecamsNorm)
+r.assign("myscorecamsNorm4", myscorecamsNorm4)
+r("save(myscorecamsNorm4, file='" + save_dir + "/myscorecamsNorm4.gzip', compress=TRUE)")
+# 
+# 
+# # In[17]:
+# 
+# 
+# # Find Score-CAM for each image and save output
+# myscorecamsNorm2 = np.zeros((n,88,88,88))
+# for i in range(n):
+#     img = np.expand_dims(x[i], axis=0)
+#     myscorecam1 = ScoreCam(model = new_model, 
+#                           img_array = img, 
+#                           layer_name = 'leaky_re_lu_2',
+#                           max_N=-1)
+#     myscorecamsNorm2[i,:,:,:] = myscorecam1
+# myscorecamsNorm2 /= np.max(myscorecamsNorm2)
+# ro = numpy2ri(myscorecamsNorm2)
+# r.assign("myscorecamsNorm2", ro)
+# r("save(myscorecamsNorm2, file='" + save_dir + "/myscorecamsNorm2.gzip', compress=TRUE)")
+# 
+# 
+# # In[ ]:
+# 
+# 
+# xAve = np.mean(x, axis=0)
+# xAve = xAve[:,:,:,0]
+# xAve.shape
+# # ro = numpy2ri(xAve)
+# r.assign("xAve", xAve)
+# r("save(xAve, file='" + save_dir + "/xAve.gzip', compress=TRUE)")
+# 
+# 
+# # In[20]:
+# 
+# 
+y_pred = dcec.model.predict(x)
+y_pred2 = y_pred[0]
+y_pred3 = y_pred2.argmax(1)
+y_pred3 == 0
+# 
+# # In[ ]:
+# 
+# 
+# x0 = np.mean(x[y_pred3 == 0,:,:], axis=0)
+# x0 = x0[:,:,:,0]
+# # ro = numpy2ri(x0)
+# r.assign("x0", x0)
+# r("save(x0, file='" + save_dir + "/x0.gzip', compress=TRUE)")
+# 
+# 
+# # In[ ]:
+# 
+# 
+# x1 = np.mean(x[y_pred3 == 1,:,:], axis=0)
+# x1 = x1[:,:,:,0]
+# # ro = numpy2ri(x1)
+# r.assign("x1", x1)
+# r("save(x1, file='" + save_dir + "/x1.gzip', compress=TRUE)")
+# 
+# 
+# # In[18]:
+# 
+# 
+scAveNorm = np.mean(myscorecamsNorm4, axis=0)
+# ro = numpy2ri(scAveNorm)
+r.assign("scAveNorm", scAveNorm)
+r("save(scAveNorm, file='" + save_dir + "/scAveNorm.gzip', compress=TRUE)")
+
+
+# In[24]:
+
+
+sc0Norm = np.mean(myscorecamsNorm4[y_pred3 == 0,:,:], axis=0)
+# ro = numpy2ri(sc0Norm)
+r.assign("sc0Norm", sc0Norm)
+r("save(sc0Norm, file='" + save_dir + "/sc0Norm.gzip', compress=TRUE)")
+
+
+# In[25]:
+
+
+sc1Norm = np.mean(myscorecamsNorm4[y_pred3 == 1,:,:], axis=0)
+# ro = numpy2ri(sc1Norm)
+r.assign("sc1Norm", sc1Norm)
+r("save(sc1Norm, file='" + save_dir + "/sc1Norm.gzip', compress=TRUE)")
+
+
+sc2Norm = np.mean(myscorecamsNorm4[y_pred3 == 2,:,:], axis=0)
+# ro = numpy2ri(sc2Norm)
+r.assign("sc2Norm", sc2Norm)
+r("save(sc2Norm, file='" + save_dir + "/sc2Norm.gzip', compress=TRUE)")
+
+
+sc3Norm = np.mean(myscorecamsNorm4[y_pred3 == 3,:,:], axis=0)
+# ro = numpy2ri(sc3Norm)
+r.assign("sc3Norm", sc3Norm)
+r("save(sc3Norm, file='" + save_dir + "/sc3Norm.gzip', compress=TRUE)")
+
+# 
+# # In[26]:
+# 
+# 
+# sc1Norm_2 = np.mean(myscorecamsNorm2[y_pred3 == 1,:,:], axis=0)
+# ro = numpy2ri(sc1Norm_2)
+# r.assign("sc1Norm_2", ro)
+# r("save(sc1Norm_2, file='" + save_dir + "/sc1Norm_2.gzip', compress=TRUE)")
+# 
+# 
+# # In[27]:
+# 
+# 
+# sc0Norm_2 = np.mean(myscorecamsNorm2[y_pred3 == 0,:,:], axis=0)
+# ro = numpy2ri(sc0Norm_2)
+# r.assign("sc0Norm_2", ro)
+# r("save(sc0Norm_2, file='" + save_dir + "/sc0Norm_2.gzip', compress=TRUE)")
+# 
+# 
+# # In[ ]:
+# 
+# 
+# 
+# 
+# 
+# # In[ ]:
+# 
+# 
+# # # Now SD
+# xAveSD = np.std(x, axis=0)
+# xAveSD = xAveSD[:,:,:,0]
+# # ro = numpy2ri(xAveSD)
+# r.assign("xAveSD", xAveSD)
+# r("save(xAveSD, file='" + save_dir + "/xAveSD.gzip', compress=TRUE)")
+# 
+# 
+# # In[ ]:
+# 
+# 
+# 
+# 

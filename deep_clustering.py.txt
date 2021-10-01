@@ -1,0 +1,419 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+# Sys.setenv(RETICULATE_PYTHON = "/Users/sarahryan/Documents/GitHub/CLAM/venv3/bin/python3")
+# reticulate::use_virtualenv('venv3')
+# library(reticulate)
+# use_virtualenv('venv3')
+
+
+# In[1]:
+import argparse
+parser = argparse.ArgumentParser(description='train')
+parser.add_argument('--wd', default="/Users/sarahryan/Documents/GitHub/CLAM_data/")
+parser.add_argument('--dataset', default='PNC')
+parser.add_argument('--ks', default=[2,3,4,5,6,7,8], type=int)
+parser.add_argument('--cae_weights', default="/Users/sarahryan/Documents/GitHub/CLAM_data/PNC/pretrain_cae_model.h5")
+parser.add_argument('--filters', default=[16,32,64,60], type=int)
+parser.add_argument('--epochs', default=100, type=int)
+parser.add_argument('--update_interval', default=10, type=int)
+parser.add_argument('--maxiter', default=100, type=int)
+parser.add_argument('--gamma', default=0.1, type=float,help='coefficient of clustering loss')
+parser.add_argument('--optimizer', default='adam')
+args = parser.parse_args()
+print(args)
+
+# Inputs
+wd = args.wd
+dataset = args.dataset
+ks = args.ks
+cae_weights= args.cae_weights
+filters=args.filters
+epochs=args.epochs
+update_interval=args.update_interval
+maxiter=args.maxiter
+gamma=args.gamma
+optimizer = args.optimizer
+
+
+# In[2]:
+
+
+# Import packages
+from time import time
+import numpy as np
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"
+import keras
+from keras import backend as K
+from keras.engine.topology import Layer, InputSpec
+from keras.layers import Input, Conv3D, Conv3DTranspose, Dense, Flatten, Reshape, GlobalAveragePooling2D, LeakyReLU
+from keras.layers.core import Lambda
+from keras.models import Sequential, Model
+from keras.utils.vis_utils import plot_model
+from sklearn.metrics import accuracy_score
+from sklearn.metrics.cluster import normalized_mutual_info_score, adjusted_rand_score
+from sklearn.cluster import KMeans
+import metrics # I have this file
+import math
+import tensorflow as tf
+from tensorflow.python.framework import ops
+import matplotlib.pyplot as plt
+import math
+from glob import glob
+import rpy2.robjects as robjects
+from scipy.optimize import linear_sum_assignment
+
+
+
+# In[3]:
+
+# Select files
+save_dir = wd + dataset
+# cae_weights = save_dir + '/pretrain_cae_model_temp.h5'
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+files = glob(save_dir + "/*.Rdata")
+n = len(files)
+y = [0] * n
+y = np.array(y)
+print(files)
+np.savetxt(save_dir + '/ids.csv', files, fmt='%s')
+
+
+# In[4]:
+
+
+# Read in files
+x = np.zeros((len(files),88,88,88,1))
+i = 0
+for file in files:
+    print(file)
+    robjects.r['load'](file)
+    x[i,:,:,:,0] = robjects.r['img']
+    i += 1
+print(x.shape)
+# Normalize images
+nm = np.max(x)
+x = (x)/nm
+
+# Set the background to the mean of all the images.
+x0 = x[x!=0]
+idx = x == 0
+x[idx] = x0.mean()
+input_shape=x.shape[1:]
+
+
+# In[5]:
+
+
+def CAE(input_shape=(88, 88, 88, 1), filters=[16,32, 64, 60]):
+    model = Sequential()
+    if input_shape[0] % 8 == 0:
+        pad3 = 'same'
+    else:
+        pad3 = 'valid'
+    myaf = LeakyReLU(alpha=0.1) # 'relu'
+    model.add(Conv3D(filters[0], 4, strides=2, padding='same', name='conv1', input_shape=input_shape))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Conv3D(filters[1], 4, strides=2, padding='same', name='conv2'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Conv3D(filters[2], 4, strides=2, padding='same', name='conv3'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Flatten())
+    model.add(Dense(units=filters[3], name='embedding'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Dense(units=filters[2]*int(model.layers[4].output.shape[1])*int(model.layers[4].output.shape[2])*int(model.layers[4].output.shape[3]), activation='relu'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Reshape((int(model.layers[4].output.shape[1]), int(model.layers[4].output.shape[2]), int(model.layers[4].output.shape[3]), filters[2])))
+    model.add(Conv3DTranspose(filters[1], 4, strides=2, padding='same', name='deconv3'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Conv3DTranspose(filters[0], 4, strides=2, padding='same', name='deconv2'))
+    model.add(LeakyReLU(alpha=0.1))
+
+    model.add(Conv3DTranspose(input_shape[3], 4, strides=2, padding='same', name='deconv1'))
+    model.add(LeakyReLU(alpha=0.1, name='reconstruction'))
+    # model.summary()
+    return model
+# cae = CAE()
+# cae.summary()
+# cae.layers
+
+
+# In[6]:
+
+
+class ClusteringLayer(Layer):
+    """
+    Clustering layer converts input sample (feature) to soft label, i.e. a vector that represents the probability of the
+    sample belonging to each cluster. The probability is calculated with student's t-distribution.
+    # Example
+    ```
+        model.add(ClusteringLayer(n_clusters=10))
+    ```
+    # Arguments
+        n_clusters: number of clusters.
+        weights: list of Numpy array with shape `(n_clusters, n_features)` witch represents the initial cluster centers.
+        alpha: parameter in Student's t-distribution. Default to 1.0.
+    # Input shape
+        2D tensor with shape: `(n_samples, n_features)`.
+    # Output shape
+        2D tensor with shape: `(n_samples, n_clusters)`.
+    """
+
+    def __init__(self, n_clusters, weights=None, alpha=1.0, **kwargs):
+        if 'input_shape' not in kwargs and 'input_dim' in kwargs:
+            kwargs['input_shape'] = (kwargs.pop('input_dim'),)
+        super(ClusteringLayer, self).__init__(**kwargs)
+        self.n_clusters = n_clusters
+        self.alpha = alpha
+        self.initial_weights = weights
+        self.input_spec = InputSpec(ndim=2)
+
+    def build(self, input_shape):
+        assert len(input_shape) == 2
+        input_dim = input_shape[1]
+        self.input_spec = InputSpec(dtype=K.floatx(), shape=(None, input_dim))
+        self.clusters = self.add_weight(shape = (self.n_clusters, input_dim), initializer='glorot_uniform', name='clusters')
+        if self.initial_weights is not None:
+            self.set_weights(self.initial_weights)
+            del self.initial_weights
+        self.built = True
+
+    def call(self, inputs, **kwargs):
+        """ student t-distribution, as same as used in t-SNE algorithm.
+                 q_ij = 1/(1+dist(x_i, u_j)^2), then normalize it.
+        Arguments:
+            inputs: the variable containing data, shape=(n_samples, n_features)
+        Return:
+            q: student's t-distribution, or soft labels for each sample. shape=(n_samples, n_clusters)
+        """
+        myinputs = K.expand_dims(inputs, axis=1)
+        q = 1.0 / (1.0 + (K.sum(K.square(myinputs - self.clusters), axis=2) / self.alpha))
+        q **= (self.alpha + 1.0) / 2.0
+        q = K.transpose(K.transpose(q) / K.sum(q, axis=1))
+        return q
+
+    def compute_output_shape(self, input_shape):
+        assert input_shape and len(input_shape) == 2
+        return input_shape[0], self.n_clusters
+
+    def get_config(self):
+        config = {'n_clusters': self.n_clusters}
+        base_config = super(ClusteringLayer, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+# In[7]:
+
+
+class DCEC(object):
+    def __init__(self,
+                 input_shape,
+                 filters=[32, 64, 128, 10],
+                 n_clusters=10,
+                 alpha=1.0):
+
+        super(DCEC, self).__init__()
+
+        self.n_clusters = n_clusters
+        self.input_shape = input_shape
+        self.alpha = alpha
+        self.pretrained = False
+        self.y_pred = []
+
+        self.cae = CAE(input_shape, filters)
+        hidden = self.cae.get_layer(name='embedding').output
+        self.encoder = Model(inputs=self.cae.input, outputs=hidden)
+
+        # Define DCEC model
+        clustering_layer = ClusteringLayer(self.n_clusters, name='clustering')(hidden)
+        self.model = Model(inputs=self.cae.input,
+                           outputs=[clustering_layer, self.cae.output])
+
+    def pretrain(self, x, epochs=200, optimizer='adam', save_dir='results/temp'):
+        print('...Pretraining...')
+        self.cae.compile(optimizer=optimizer, loss='mse')
+        from keras.callbacks import CSVLogger
+        csv_logger = CSVLogger(save_dir + '/pretrain_log.csv')
+
+        # begin training
+        t0 = time()
+        for ite in range(int(epochs)):
+            self.cae.fit(x, x, epochs=1, callbacks=[csv_logger])
+            print(ite)
+            self.cae.save(save_dir + '/pretrain_cae_model_temp.h5')
+
+        print('Pretraining time: ', time() - t0)
+        self.cae.save(save_dir + '/pretrain_cae_model.h5')
+        print('Pretrained weights are saved to %s/pretrain_cae_model.h5' % save_dir)
+        self.pretrained = True
+
+    def load_weights(self, weights_path):
+        self.model.load_weights(weights_path)
+
+    def extract_feature(self, x):  # extract features from before clustering layer
+        return self.encoder.predict(x)
+
+    def predict(self, x):
+        q, _ = self.model.predict(x, verbose=0)
+        return q.argmax(1)
+
+    def predictSoft(self, x):
+        q, _ = self.model.predict(x, verbose=0)
+        return q
+
+    @staticmethod
+    def target_distribution(q):
+        weight = q ** 2 / q.sum(0)
+        return (weight.T / weight.sum(1)).T
+
+    def compile(self, loss=['kld', 'mse'], loss_weights=[1, 1], optimizer='adam'):
+        self.model.compile(loss=loss, loss_weights=loss_weights, optimizer=optimizer)
+    # def compile(self, loss=['kld', 'mse'], loss_weights=[1, 1], optimizer='adam'):
+    #    if (loss == 'mse'):
+     #       self.model.compile(loss=loss, loss_weights=loss_weights, optimizer=optimizer)
+      #  else:
+       #     unconf_indices, conf_indices = generate_unconflicted_data_index(self.model.y_pred, beta1=0.5, beta2=0.25)
+        #    self.model.compile(loss=[custom_loss(unconf_indices, conf_indices), custom_loss2(unconf_indices, conf_indices)], loss_weights=[0.1, 1], optimizer=optimizer)
+            # self.model.compile(loss=['kld', 'mse'], loss_weights=[0.1, 1], optimizer=optimizer)
+
+    def fit(self, x, y=None, epochs=200, maxiter=2e4, tol=1e-3,
+            update_interval=10, cae_weights=None, save_dir='./results/temp'):
+
+        print('Update interval', update_interval)
+        save_interval = 1
+        print('Save interval', save_interval)
+
+        # Step 1: pretrain if necessary
+        t0 = time()
+        if not self.pretrained and cae_weights is None:
+            print('...pretraining CAE using default hyper-parameters:')
+            print('   optimizer=\'adam\';   epochs=' + str(epochs))
+            self.pretrain(x, epochs = epochs, save_dir=save_dir)
+            self.pretrained = True
+        elif cae_weights is not None:
+            self.cae.load_weights(cae_weights)
+            print('cae_weights is loaded successfully.')
+
+        # Step 2: initialize cluster centers using k-means
+        t1 = time()
+        print('Initializing cluster centers with k-means.')
+        kmeans = KMeans(n_clusters=self.n_clusters, n_init=100)
+        featuresPre = self.encoder.predict(x)
+        np.savetxt(save_dir + '/featuresPre.csv', featuresPre, delimiter=",")
+        self.y_pred = kmeans.fit_predict(featuresPre)
+        y_pred_last = np.copy(self.y_pred)
+        self.model.get_layer(name='clustering').set_weights([kmeans.cluster_centers_])
+
+        # Step 3: deep clustering
+        # logging file
+        import csv, os
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        logfile = open(save_dir + '/dcec_log' + str(self.n_clusters) + '.csv', 'w')
+        logwriter = csv.DictWriter(logfile, fieldnames=['iter', 'acc', 'nmi', 'L', 'Lc', 'Lr'])
+        logwriter.writeheader()
+
+        t2 = time()
+        loss = [0, 0, 0]
+        index = 0
+        ite = 0
+        acc = 0
+        nmi = 0
+        for ite in range(int(maxiter)):
+            if ite % update_interval == 0:
+                q = self.predictSoft(x)
+                p = self.target_distribution(q)  # update the auxiliary target distribution p
+
+                # evaluate the clustering performance
+                self.y_pred = q.argmax(1)
+                # if y is not None:
+                #     acc = np.round(metrics.acc(y, self.y_pred), 5)
+                #     nmi = np.round(metrics.nmi(y, self.y_pred), 5)
+                    # loss = np.round(loss, 5)
+                logdict = dict(iter=ite, acc=acc, nmi=nmi, L=loss[0], Lc=loss[1], Lr=loss[2])
+                logwriter.writerow(logdict)
+                print('Iter', ite, ': Acc', acc, ', nmi', nmi, '; loss=', loss)
+
+            # save intermediate model
+            if ite % 10 == 0:
+                print('saving model to:', save_dir + '/dcec_model_k' + str(n_clusters) + "_"+ str(ite) + '.h5')
+                self.model.save_weights(save_dir + '/dcec_model_k' + str(n_clusters) + "_"+ str(ite) + '.h5')
+            
+            # I wonder if saving here makes it take awhile... maybe don't do this. 
+            # self.model.save_weights(save_dir + '/dcec_model_k' + str(n_clusters) + "_temp.h5")
+            print(str(ite))
+
+
+            # train on batch
+            myfit = self.model.fit(x=x,y=[p, x],verbose=0,epochs=1)
+            L = myfit.history['loss'][0]
+            Lc = myfit.history['clustering_loss'][0]
+            Lr = myfit.history['reconstruction_loss'][0]
+            loss = [L,Lc,Lr]
+
+            ite += 1
+
+        # save the trained model
+        logfile.close()
+        print('saving model to:', save_dir + '/dcec_model_final' + str(self.n_clusters) + '.h5')
+        self.model.save_weights(save_dir + '/dcec_model_final' + str(self.n_clusters) + '.h5')
+        t3 = time()
+        print('Pretrain time:  ', t1 - t0)
+        print('Clustering time:', t3 - t1)
+        print('Total time:     ', t3 - t0)
+
+
+# In[8]:
+
+
+# Repeat for other n_clusters
+ij = 0
+for n_clusters in ks:
+    # For the first time, do pretraining
+    if cae_weights is None:
+        if ij == 0:
+            cae_weights = None
+        if ij > 0:
+            cae_weights = save_dir + '/pretrain_cae_model.h5'
+
+    # Prepare the DCEC model
+    dcec = DCEC(input_shape=input_shape, filters=filters, n_clusters=n_clusters)
+    plot_model(dcec.model, to_file=save_dir + '/dcec_model' + str(n_clusters) + '.png', show_shapes=True)
+
+    # Begin clustering.
+    optimizer = 'adam'
+    dcec.compile(loss=['kld', 'mse'], loss_weights=[gamma, 1], optimizer=optimizer)
+    dcec.fit(x, y=y, maxiter=maxiter,epochs=epochs,
+             update_interval=update_interval,
+             save_dir=save_dir,
+             cae_weights= cae_weights)
+    # dcec.model.load_weights(cae_weights2)
+    # y_pred = dcec.y_pred
+    # print('acc = %.4f, nmi = %.4f, ari = %.4f' % (metrics.acc(y, y_pred), metrics.nmi(y, y_pred), metrics.ari(y, y_pred)))
+
+    # Extract cluster centers and save
+    cc = dcec.model.layers[18].get_weights()[0]
+    np.savetxt(save_dir + '/ClusterCenters' + str(n_clusters) + '.csv', cc, delimiter=",")
+
+    # Extract features and save
+    features = dcec.encoder.predict(x)
+    np.savetxt(save_dir + '/features' + str(n_clusters) + '.csv', features, delimiter=",")
+
+    # Save cluster assignments
+    np.savetxt(save_dir + '/ClusterAssignments' + str(n_clusters) + '.csv', dcec.predict(x), delimiter=",")
+    np.savetxt(save_dir + '/ClusterAssignmentsSoft' + str(n_clusters) + '.csv', dcec.predictSoft(x), delimiter=",")
+
+    ij = ij + 1
+
+
+# In[ ]:
